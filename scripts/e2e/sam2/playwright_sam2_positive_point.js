@@ -20,37 +20,29 @@
  */
 const fs = require('fs');
 const path = require('path');
-
-const repoRoot = path.resolve(__dirname, '..', '..', '..');
-
-function loadEnv(envPath) {
-    const env = {};
-    if (!fs.existsSync(envPath)) return env;
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const idx = trimmed.indexOf('=');
-        if (idx > 0) {
-            env[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
-        }
-    }
-    return env;
-}
+const {
+    repoRoot,
+    loadEnv,
+    makeRunDir,
+    requireAuthState,
+    getCanvasHashes,
+    changedCanvasCount,
+    getInteractionPointStats,
+    getAnnotationSummary,
+    clearJobAnnotations,
+    finishAndSave,
+    openAiTools,
+    selectSam2Interactor,
+    setStartWithBBox,
+    clickInteract,
+} = require('./e2e_utils');
 
 async function main() {
     const env = loadEnv(path.join(repoRoot, '.env'));
     const host = env.CVAT_E2E_HOST || 'http://localhost:8080';
 
-    const authStatePath = path.join(repoRoot, 'temp', 'e2e_sam2', 'check', 'auth-state.json');
-    if (!fs.existsSync(authStatePath)) {
-        console.error(`ERROR: Auth state not found at ${authStatePath}. Run 'just e2e-login' first.`);
-        process.exit(1);
-    }
-
-    const ts = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const runDir = path.join(repoRoot, 'temp', 'e2e_sam2', `run_positive_${ts}`);
-    fs.mkdirSync(runDir, { recursive: true });
+    const authStatePath = requireAuthState();
+    const runDir = makeRunDir('run_positive');
 
     const TASK_ID = 181;
     const JOB_ID = 180;
@@ -68,6 +60,7 @@ async function main() {
         viewport: { width: 1920, height: 1080 },
     });
     const page = await context.newPage();
+    const shouldClearAnnotations = env.CVAT_E2E_CLEAR_ANNOTATIONS !== '0';
 
     // Collect console logs
     const consoleLogs = [];
@@ -104,6 +97,9 @@ async function main() {
     try {
         // Step 1: Navigate to job page
         console.log('Step 1: Navigate to job page...');
+        const clearResult = await clearJobAnnotations(page, host, JOB_ID, shouldClearAnnotations);
+        console.log(`  Clear annotations: ${JSON.stringify(clearResult)}`);
+        results.steps.clearAnnotations = clearResult;
         await page.goto(JOB_URL, { waitUntil: 'networkidle', timeout: 60000 });
         await page.waitForTimeout(3000);
         console.log(`  URL: ${page.url()}`);
@@ -113,108 +109,36 @@ async function main() {
         const canvasCount = await page.$$eval('canvas', els => els.length);
         console.log(`  Canvas elements: ${canvasCount}`);
         results.steps.jobLoad = { success: canvasCount > 0, canvasCount };
+        const annotationsBefore = await getAnnotationSummary(page, host, JOB_ID);
+        results.steps.annotationsBefore = annotationsBefore;
 
         // Step 2: Open AI Tools popover
         console.log('Step 2: Open AI Tools...');
-        const aiToolsBtn = await page.$('.cvat-tools-control');
-        if (!aiToolsBtn) throw new Error('AI Tools button not found');
-        await aiToolsBtn.click();
-        await page.waitForTimeout(1000);
+        await openAiTools(page);
         await page.screenshot({ path: path.join(runDir, '02_ai_tools_opened.png'), fullPage: true });
         console.log('  AI Tools popover opened');
         results.steps.aiToolsOpen = { success: true };
 
         // Step 3: Select SAM2 interactor and configure point mode
-        // IMPORTANT: Ant Design Select dropdown causes popover to close.
-        // We must select the interactor FIRST, then re-open the popover if needed.
         console.log('Step 3: Select SAM2 interactor...');
-
-        // Check current interactor selection text
-        const currentSelection = await page.$eval(
-            '.ant-popover .ant-select-selection-item, .ant-popover-content .ant-select-selection-item',
-            el => el.textContent
-        ).catch(() => 'unknown');
-        console.log(`  Current interactor: "${currentSelection}"`);
-
-        if (!currentSelection.includes('2.1')) {
-            // Need to select SAM 2.1 - this will close the popover
-            console.log('  Need to switch to SAM 2.1...');
-            const popoverSelects = await page.$$('.ant-popover .ant-select, .ant-popover-content .ant-select');
-            // The second select in the popover is the interactor (first is label)
-            const interactorSelect = popoverSelects.length >= 2 ? popoverSelects[1] : popoverSelects[0];
-            if (interactorSelect) {
-                await interactorSelect.click();
-                await page.waitForTimeout(500);
-                await page.screenshot({ path: path.join(runDir, '03a_dropdown_open.png'), fullPage: true });
-
-                // Select SAM 2.1 option
-                const sam2Option = await page.$('.ant-select-item-option:has-text("Segment Anything 2.1")');
-                if (sam2Option) {
-                    await sam2Option.click();
-                    await page.waitForTimeout(500);
-                    console.log('  Selected "Segment Anything 2.1"');
-                } else {
-                    console.log('  SAM2 option not found; pressing Escape');
-                    await page.keyboard.press('Escape');
-                }
-
-                // Re-open AI Tools popover (it likely closed)
-                await page.waitForTimeout(500);
-                const aiToolsBtn2 = await page.$('.cvat-tools-control');
-                if (aiToolsBtn2) {
-                    await aiToolsBtn2.click();
-                    await page.waitForTimeout(1000);
-                    console.log('  Re-opened AI Tools popover');
-                }
-            }
-        }
+        const selectionResult = await selectSam2Interactor(page);
+        console.log(`  SAM2 selection result: ${JSON.stringify(selectionResult)}`);
         await page.screenshot({ path: path.join(runDir, '03b_interactor_selected.png'), fullPage: true });
         results.steps.interactorSelect = { success: true };
 
         // Step 4: Ensure "Start with bounding box" is OFF for point mode
         console.log('Step 4: Ensure point mode (not bbox)...');
-        // Use evaluate to toggle the switch via DOM to avoid popover-closing issues
-        const switchToggled = await page.evaluate(() => {
-            // Find all switches in the interactor setups area
-            const setupDivs = document.querySelectorAll('.cvat-tools-interactor-setups div');
-            for (const div of setupDivs) {
-                if (div.textContent && div.textContent.includes('Start with a bounding box')) {
-                    const sw = div.querySelector('.ant-switch');
-                    if (sw && sw.classList.contains('ant-switch-checked')) {
-                        sw.click();
-                        return { toggled: true, wasChecked: true };
-                    }
-                    return { toggled: false, wasChecked: sw ? sw.classList.contains('ant-switch-checked') : null };
-                }
-            }
-            return { toggled: false, wasChecked: null, error: 'Switch not found' };
-        });
+        const switchToggled = await setStartWithBBox(page, false);
         console.log(`  Switch toggle result: ${JSON.stringify(switchToggled)}`);
         await page.waitForTimeout(500);
         await page.screenshot({ path: path.join(runDir, '04_point_mode_set.png'), fullPage: true });
         results.steps.pointMode = { success: true, ...switchToggled };
 
         // Step 5: Click "Interact" button to enter interaction mode
-        // The popover may have closed from the switch toggle. Re-open it.
         console.log('Step 5: Click Interact button...');
-        // Re-open popover to make the Interact button visible
-        const aiToolsBtn4 = await page.$('.cvat-tools-control');
-        if (aiToolsBtn4) {
-            await aiToolsBtn4.click();
-            await page.waitForTimeout(1000);
-        }
+        await openAiTools(page);
         await page.screenshot({ path: path.join(runDir, '05a_popover_reopened.png'), fullPage: true });
-
-        // Now click the Interact button
-        const interactBtnFinal = await page.$('.cvat-tools-interact-button');
-        if (!interactBtnFinal) throw new Error('Interact button not found after re-open');
-
-        const isDisabled = await interactBtnFinal.evaluate(el => el.disabled || el.classList.contains('ant-btn-disabled'));
-        console.log(`  Interact button disabled: ${isDisabled}`);
-        if (isDisabled) throw new Error('Interact button is disabled');
-
-        await interactBtnFinal.click();
-        await page.waitForTimeout(1500);
+        await clickInteract(page);
         await page.screenshot({ path: path.join(runDir, '05_interact_mode.png'), fullPage: true });
         console.log('  Entered interaction mode');
         results.steps.interact = { success: true };
@@ -242,6 +166,8 @@ async function main() {
 
         // Clear any previous lambda responses for comparison
         const lambdaCountBefore = lambdaResponses.length;
+        const canvasBefore = await getCanvasHashes(page);
+        const pointsBefore = await getInteractionPointStats(page);
 
         await page.mouse.click(clickX, clickY, { button: 'left' });
         console.log('  Left click sent');
@@ -258,6 +184,9 @@ async function main() {
         }
 
         await page.screenshot({ path: path.join(runDir, '06_after_click.png'), fullPage: true });
+        const canvasAfterClick = await getCanvasHashes(page);
+        const pointsAfterClick = await getInteractionPointStats(page);
+        const canvasChangedAfterClick = changedCanvasCount(canvasBefore, canvasAfterClick);
 
         if (lambdaReceived) {
             const latestLambda = lambdaResponses[lambdaResponses.length - 1];
@@ -277,12 +206,23 @@ async function main() {
             console.log('    - The embeddings were already cached (no server call needed)');
             console.log('    - The interaction mode was not active');
             results.steps.positiveClick = {
-                success: false,
-                error: 'No lambda response within timeout',
+                success: pointsAfterClick.positive > pointsBefore.positive,
+                note: 'No lambda response within timeout; prompt registration and saved annotation are authoritative when embeddings are cached.',
                 lambdaCountBefore,
                 lambdaCountAfter: lambdaResponses.length,
             };
         }
+        results.steps.positivePrompt = {
+            success: pointsAfterClick.positive > pointsBefore.positive,
+            before: pointsBefore,
+            after: pointsAfterClick,
+        };
+        results.steps.canvasChangeAfterPositive = {
+            diagnosticOnly: true,
+            changedCanvasCount: canvasChangedAfterClick,
+            before: canvasBefore,
+            after: canvasAfterClick,
+        };
 
         // Step 7: Check for mask overlay on canvas
         console.log('Step 7: Check for mask on canvas...');
@@ -292,40 +232,20 @@ async function main() {
         // The mask is rendered as a canvas overlay, not SVG shapes.
         // Also check for interaction point markers (green dots).
         const objectsInDOM = await page.evaluate(() => {
-            // SVG shapes (committed annotations)
             const svgShapes = document.querySelectorAll('.cvat_canvas_shape, .cvat_canvas_shape_mask, [data-type="mask"]');
             const annotObjects = document.querySelectorAll('.cvat-objects-sidebar-state-item');
-            // Interaction points (green/red dots on canvas, rendered as SVG circles)
-            const interactionPts = document.querySelectorAll('circle, .cvat_canvas_interaction_point');
-            // Canvas elements that may contain mask overlay
+            const interactionPts = document.querySelectorAll('.cvat_interaction_point');
             const canvases = document.querySelectorAll('.cvat-canvas-container canvas');
-            // Check if any canvas has non-trivial content (mask overlay)
-            let maskCanvasDetected = false;
-            for (const c of canvases) {
-                try {
-                    const ctx = c.getContext('2d');
-                    if (ctx) {
-                        const data = ctx.getImageData(0, 0, Math.min(c.width, 10), Math.min(c.height, 10)).data;
-                        // Check if any pixel has alpha > 0 (mask overlay)
-                        for (let i = 3; i < data.length; i += 4) {
-                            if (data[i] > 0) { maskCanvasDetected = true; break; }
-                        }
-                    }
-                } catch (_) {}
-                if (maskCanvasDetected) break;
-            }
             return {
                 svgShapeCount: svgShapes.length,
                 sidebarObjectCount: annotObjects.length,
                 interactionPointCount: interactionPts.length,
                 canvasCount: canvases.length,
-                maskCanvasDetected,
             };
         });
         console.log(`  SVG shapes on canvas: ${objectsInDOM.svgShapeCount}`);
         console.log(`  Sidebar annotation objects: ${objectsInDOM.sidebarObjectCount}`);
         console.log(`  Interaction points (circles): ${objectsInDOM.interactionPointCount}`);
-        console.log(`  Mask canvas detected: ${objectsInDOM.maskCanvasDetected}`);
         results.steps.maskCheck = objectsInDOM;
 
         // Step 8: Check UI state
@@ -352,13 +272,26 @@ async function main() {
         console.log(`  Green circles (positive points): ${uiState.greenCircles}`);
         results.steps.uiState = uiState;
 
-        // Determine overall success
-        // For positive point, success means:
-        // 1. Interaction mode active AND
-        // 2. Mask visible (canvas overlay or SVG shape) OR interaction point visible
-        const maskGenerated = objectsInDOM.maskCanvasDetected || objectsInDOM.svgShapeCount > 0;
-        const pointRegistered = objectsInDOM.interactionPointCount > 0 || uiState.greenCircles > 0;
-        results.overall = (maskGenerated || pointRegistered) ? 'PASS' : (lambdaReceived ? 'PARTIAL' : 'FAIL');
+        // Step 9: Finish the interaction and verify it becomes a persisted semi-auto mask.
+        console.log('Step 9: Finish interaction and check annotations...');
+        const finishResult = await finishAndSave(page, runDir, host, JOB_ID, 'positive');
+        const finalAnnotations = await getAnnotationSummary(page, host, JOB_ID);
+        results.steps.finishAndSave = finishResult;
+        results.steps.finalAnnotations = finalAnnotations;
+
+        const pointRegistered = pointsAfterClick.positive > pointsBefore.positive;
+        const persistedMask = (
+            finalAnnotations.maskCount > annotationsBefore.maskCount &&
+            finalAnnotations.semiAutoCount > annotationsBefore.semiAutoCount
+        );
+        results.steps.persistenceCheck = {
+            success: persistedMask,
+            beforeMaskCount: annotationsBefore.maskCount,
+            afterMaskCount: finalAnnotations.maskCount,
+            beforeSemiAutoCount: annotationsBefore.semiAutoCount,
+            afterSemiAutoCount: finalAnnotations.semiAutoCount,
+        };
+        results.overall = pointRegistered && persistedMask ? 'PASS' : 'FAIL';
 
     } catch (err) {
         console.error(`ERROR: ${err.message}`);

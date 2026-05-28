@@ -23,23 +23,20 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const {
+    loadEnv,
+    makeRunDir,
+    requireAuthState,
+    getAnnotationSummary,
+    clearJobAnnotations,
+    finishAndSave,
+    openAiTools,
+    selectSam2Interactor,
+    setStartWithBBox,
+    clickInteract,
+} = require('./e2e_utils');
 
 // --- helpers ---
-
-function loadEnv(envPath) {
-    const env = {};
-    if (!fs.existsSync(envPath)) return env;
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const idx = trimmed.indexOf('=');
-        if (idx > 0) {
-            env[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
-        }
-    }
-    return env;
-}
 
 function httpRequest(url, opts, body) {
     return new Promise((resolve, reject) => {
@@ -83,21 +80,15 @@ async function main() {
     const host = env.CVAT_E2E_HOST || 'http://localhost:8080';
     const username = env.CVAT_E2E_USER;
     const password = env.CVAT_E2E_PASSWORD;
+    const shouldClearAnnotations = env.CVAT_E2E_CLEAR_ANNOTATIONS !== '0';
 
     if (!username || !password) {
         console.error('ERROR: CVAT_E2E_USER and CVAT_E2E_PASSWORD must be set in .env');
         process.exit(1);
     }
 
-    const authStatePath = path.join(repoRoot, 'temp', 'e2e_sam2', 'check', 'auth-state.json');
-    if (!fs.existsSync(authStatePath)) {
-        console.error(`ERROR: Auth state not found at ${authStatePath}. Run 'just e2e-login' first.`);
-        process.exit(1);
-    }
-
-    const ts = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const runDir = path.join(repoRoot, 'temp', 'e2e_sam2', `run_bbox_${ts}`);
-    fs.mkdirSync(runDir, { recursive: true });
+    const authStatePath = requireAuthState();
+    const runDir = makeRunDir('run_bbox');
 
     const TASK_ID = 181;
     const JOB_ID = 180;
@@ -258,7 +249,11 @@ async function main() {
     });
 
     let phase2Success = false;
+    let uiSummary = null;
     try {
+        const clearResult = await clearJobAnnotations(page, host, JOB_ID, shouldClearAnnotations);
+        console.log(`  Clear annotations: ${JSON.stringify(clearResult)}`);
+
         // Navigate to job page
         console.log(`  Opening job: ${JOB_URL}`);
         await page.goto(JOB_URL, { waitUntil: 'networkidle', timeout: 60000 });
@@ -282,22 +277,113 @@ async function main() {
             console.log('  WARNING: No canvas elements found');
         }
 
-        // Check for any SAM2-related elements in the UI
-        const sam2Elements = await page.evaluate(() => {
-            const elements = [];
-            // Check for AI tools menu
-            const aiButton = document.querySelector('[data-icon="magic"]') ||
-                            document.querySelector('[aria-label*="AI"]') ||
-                            document.querySelector('button[class*="magic"]');
-            if (aiButton) elements.push('ai-button found');
+        const annotationsBefore = await getAnnotationSummary(page, host, JOB_ID);
+        console.log(`  Annotations before: masks=${annotationsBefore.maskCount}, semi-auto=${annotationsBefore.semiAutoCount}`);
 
-            // Check for interactor-related elements
-            const interactorEls = document.querySelectorAll('[class*="interactor"], [class*="sam"], [data-testid*="interactor"]');
-            if (interactorEls.length) elements.push(`interactor elements: ${interactorEls.length}`);
+        console.log('  Opening AI Tools and selecting SAM2 bbox mode...');
+        await openAiTools(page);
+        const selectionResult = await selectSam2Interactor(page);
+        console.log(`  SAM2 selection result: ${JSON.stringify(selectionResult)}`);
+        const bboxSwitch = await setStartWithBBox(page, true);
+        console.log(`  BBox switch result: ${JSON.stringify(bboxSwitch)}`);
+        await openAiTools(page);
+        await clickInteract(page);
+        await page.screenshot({ path: path.join(runDir, 'bbox_interact_mode.png'), fullPage: true });
 
-            return elements;
+        const drawTarget = await page.$('#cvat_canvas_background') ||
+            await page.$('.cvat-canvas-container svg') ||
+            await page.$('.cvat-canvas-container');
+        if (!drawTarget) throw new Error('Canvas draw target not found');
+        const bbox = await drawTarget.boundingBox();
+        const elementInfo = await page.evaluate(([x, y]) => {
+            const el = document.elementFromPoint(x, y);
+            return {
+                tagName: el?.tagName || null,
+                id: el?.id || null,
+                className: typeof el?.className === 'string' ? el.className : String(el?.className || ''),
+            };
+        }, [bbox.x + bbox.width / 2, bbox.y + bbox.height / 2]);
+        fs.writeFileSync(path.join(runDir, 'bbox_draw_target.json'), JSON.stringify({ bbox, elementInfo }, null, 2));
+
+        const startX = bbox.x + bbox.width * 0.35;
+        const startY = bbox.y + bbox.height * 0.30;
+        const endX = bbox.x + bbox.width * 0.65;
+        const endY = bbox.y + bbox.height * 0.70;
+        console.log(`  Dragging bbox: (${startX.toFixed(0)},${startY.toFixed(0)}) -> (${endX.toFixed(0)},${endY.toFixed(0)})`);
+        const lambdaCountBeforeBBox = lambdaResponses.length;
+        await page.mouse.move(startX, startY);
+        await page.mouse.down();
+        await page.mouse.move(endX, endY, { steps: 24 });
+        await page.mouse.up();
+
+        const stopResult = await page.evaluate(() => {
+            const rectNode = document.querySelector('.cvat_interaction_rectangle');
+            const rect = rectNode?.instance;
+            if (!rect) {
+                return { attempted: false, reason: 'active interaction rectangle not found' };
+            }
+
+            const result = {
+                attempted: true,
+                x: typeof rect.x === 'function' ? rect.x() : null,
+                y: typeof rect.y === 'function' ? rect.y() : null,
+                width: typeof rect.width === 'function' ? rect.width() : null,
+                height: typeof rect.height === 'function' ? rect.height() : null,
+                drawStopFired: false,
+                errors: [],
+            };
+
+            try {
+                rect.fire('drawstop');
+                result.drawStopFired = true;
+            } catch (error) {
+                result.errors.push(error instanceof Error ? error.message : String(error));
+            }
+
+            return result;
         });
-        console.log(`  SAM2 UI elements: ${sam2Elements.length > 0 ? sam2Elements.join(', ') : 'none detected'}`);
+        console.log(`  Draw stop result: ${JSON.stringify(stopResult)}`);
+
+        let bboxLambdaReceived = false;
+        for (let i = 0; i < 30; i++) {
+            await page.waitForTimeout(1000);
+            if (lambdaResponses.length > lambdaCountBeforeBBox) {
+                bboxLambdaReceived = true;
+                break;
+            }
+        }
+        await page.waitForTimeout(2000);
+        await page.screenshot({ path: path.join(runDir, 'bbox_after_drag.png'), fullPage: true });
+
+        const promptState = await page.evaluate(() => {
+            const rects = Array.from(document.querySelectorAll('svg rect'))
+                .filter((rect) => rect.getAttribute('stroke') || rect.classList.length);
+            const interactionPoints = document.querySelectorAll('.cvat_interaction_point');
+            return {
+                svgRectCount: rects.length,
+                interactionPointCount: interactionPoints.length,
+                interactionRectangleCount: document.querySelectorAll('.cvat_interaction_rectangle').length,
+            };
+        });
+        console.log(`  Prompt state: ${JSON.stringify(promptState)}`);
+
+        const finishResult = await finishAndSave(page, runDir, host, JOB_ID, 'bbox');
+        const finalAnnotations = await getAnnotationSummary(page, host, JOB_ID);
+        phase2Success = (
+            finalAnnotations.maskCount > annotationsBefore.maskCount &&
+            finalAnnotations.semiAutoCount > annotationsBefore.semiAutoCount
+        );
+        uiSummary = {
+            clearAnnotations: clearResult,
+            drawStop: stopResult,
+            bboxLambdaReceived,
+            promptState,
+            annotationsBefore,
+            finishAndSave: finishResult,
+            finalAnnotations,
+            persistedMask: phase2Success,
+        };
+        console.log(`  Final annotations: masks=${finalAnnotations.maskCount}, semi-auto=${finalAnnotations.semiAutoCount}`);
 
     } catch (err) {
         console.error(`  Playwright error: ${err.message}`);
@@ -308,8 +394,6 @@ async function main() {
     fs.writeFileSync(path.join(runDir, 'console_logs.json'), JSON.stringify(consoleLogs, null, 2));
     fs.writeFileSync(path.join(runDir, 'network_logs.json'), JSON.stringify(networkLogs, null, 2));
     fs.writeFileSync(path.join(runDir, 'lambda_responses.json'), JSON.stringify(lambdaResponses, null, 2));
-
-    await browser.close();
 
     // ========================================
     // Phase 3: Check annotations API
@@ -349,6 +433,7 @@ async function main() {
             console.log(`  Could not parse annotations: ${parseErr.message}`);
         }
     }
+    await browser.close();
 
     // ========================================
     // Summary
@@ -371,8 +456,9 @@ async function main() {
         phase2_playwright: {
             success: phase2Success,
             description: phase2Success
-                ? 'Job page loaded with canvas'
-                : 'Job page did not load properly',
+                ? 'BBox UI interaction persisted a semi-auto mask'
+                : 'BBox UI interaction did not persist a semi-auto mask',
+            details: uiSummary,
         },
         phase3_annotations: {
             status: annotResp.status,
@@ -381,7 +467,7 @@ async function main() {
                 ? 'Mask annotation found in job'
                 : 'No mask annotation (expected for API-only invoke)',
         },
-        overall: phase1Success ? 'PASS' : 'FAIL',
+        overall: phase1Success && phase2Success ? 'PASS' : 'FAIL',
     };
 
     fs.writeFileSync(path.join(runDir, 'bbox_summary.json'), JSON.stringify(summary, null, 2));
@@ -392,7 +478,7 @@ async function main() {
     console.log(`  Overall: ${summary.overall}`);
     console.log(`  Artifacts: ${runDir}`);
 
-    process.exit(phase1Success ? 0 : 1);
+    process.exit(summary.overall === 'PASS' ? 0 : 1);
 }
 
 main().catch(err => {

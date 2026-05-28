@@ -18,23 +18,20 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-
-const repoRoot = path.resolve(__dirname, '..', '..', '..');
-
-function loadEnv(envPath) {
-    const env = {};
-    if (!fs.existsSync(envPath)) return env;
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const idx = trimmed.indexOf('=');
-        if (idx > 0) {
-            env[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
-        }
-    }
-    return env;
-}
+const {
+    repoRoot,
+    loadEnv,
+    makeRunDir,
+    requireAuthState,
+    getInteractionPointStats,
+    getAnnotationSummary,
+    clearJobAnnotations,
+    finishAndSave,
+    openAiTools,
+    selectSam2Interactor,
+    setStartWithBBox,
+    clickInteract,
+} = require('./e2e_utils');
 
 function httpRequest(url, opts, body) {
     return new Promise((resolve, reject) => {
@@ -72,21 +69,15 @@ async function main() {
     const host = env.CVAT_E2E_HOST || 'http://localhost:8080';
     const username = env.CVAT_E2E_USER;
     const password = env.CVAT_E2E_PASSWORD;
+    const shouldClearAnnotations = env.CVAT_E2E_CLEAR_ANNOTATIONS !== '0';
 
     if (!username || !password) {
         console.error('ERROR: CVAT_E2E_USER and CVAT_E2E_PASSWORD must be set in .env');
         process.exit(1);
     }
 
-    const authStatePath = path.join(repoRoot, 'temp', 'e2e_sam2', 'check', 'auth-state.json');
-    if (!fs.existsSync(authStatePath)) {
-        console.error(`ERROR: Auth state not found at ${authStatePath}. Run 'just e2e-login' first.`);
-        process.exit(1);
-    }
-
-    const ts = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const runDir = path.join(repoRoot, 'temp', 'e2e_sam2', `run_nonsquare_${ts}`);
-    fs.mkdirSync(runDir, { recursive: true });
+    const authStatePath = requireAuthState();
+    const runDir = makeRunDir('run_nonsquare');
 
     // Non-square task: 640x360
     const TASK_ID = 182;
@@ -229,6 +220,9 @@ async function main() {
         viewport: { width: 1920, height: 1080 },
     });
     const page = await context.newPage();
+    const clearResult = await clearJobAnnotations(page, host, JOB_ID, shouldClearAnnotations);
+    console.log(`  Clear annotations: ${JSON.stringify(clearResult)}`);
+    results.steps.clearAnnotations = clearResult;
 
     const consoleLogs = [];
     page.on('console', msg => {
@@ -255,6 +249,8 @@ async function main() {
         await page.goto(JOB_URL, { waitUntil: 'networkidle', timeout: 60000 });
         await page.waitForTimeout(3000);
         await page.screenshot({ path: path.join(runDir, 'job_loaded.png'), fullPage: true });
+        const annotationsBefore = await getAnnotationSummary(page, host, JOB_ID);
+        results.steps.annotationsBefore = annotationsBefore;
 
         // Verify canvas and image dimensions
         const canvasInfo = await page.evaluate(() => {
@@ -295,53 +291,20 @@ async function main() {
         console.log('  Opening AI Tools...');
         const aiToolsBtn = await page.$('.cvat-tools-control');
         if (aiToolsBtn) {
-            await aiToolsBtn.click();
-            await page.waitForTimeout(1000);
+            await openAiTools(page);
 
             // Select SAM 2.1 if not already selected
-            const currentSel = await page.$eval(
-                '.ant-popover .ant-select-selection-item, .ant-popover-content .ant-select-selection-item',
-                el => el.textContent
-            ).catch(() => 'unknown');
-            console.log(`  Current interactor: "${currentSel}"`);
-
-            if (!currentSel.includes('2.1')) {
-                const popoverSelects = await page.$$('.ant-popover .ant-select, .ant-popover-content .ant-select');
-                const iSelect = popoverSelects.length >= 2 ? popoverSelects[1] : popoverSelects[0];
-                if (iSelect) {
-                    await iSelect.click();
-                    await page.waitForTimeout(500);
-                    const sam2Opt = await page.$('.ant-select-item-option:has-text("Segment Anything 2.1")');
-                    if (sam2Opt) { await sam2Opt.click(); await page.waitForTimeout(500); }
-                    else { await page.keyboard.press('Escape'); }
-                    // Re-open popover
-                    await page.waitForTimeout(500);
-                    const btn2 = await page.$('.cvat-tools-control');
-                    if (btn2) { await btn2.click(); await page.waitForTimeout(1000); }
-                }
-            }
+            const selectionResult = await selectSam2Interactor(page);
+            console.log(`  SAM2 selection result: ${JSON.stringify(selectionResult)}`);
 
             // Toggle "Start with bounding box" OFF via JS
-            await page.evaluate(() => {
-                const divs = document.querySelectorAll('.cvat-tools-interactor-setups div');
-                for (const div of divs) {
-                    if (div.textContent && div.textContent.includes('Start with a bounding box')) {
-                        const sw = div.querySelector('.ant-switch');
-                        if (sw && sw.classList.contains('ant-switch-checked')) sw.click();
-                    }
-                }
-            });
+            const switchResult = await setStartWithBBox(page, false);
+            console.log(`  Switch toggle: ${JSON.stringify(switchResult)}`);
             await page.waitForTimeout(500);
 
             // Re-open popover (switch toggle may have closed it) then click Interact
-            const btn3 = await page.$('.cvat-tools-control');
-            if (btn3) { await btn3.click(); await page.waitForTimeout(1000); }
-            let interactBtn = await page.$('.cvat-tools-interact-button');
-            if (interactBtn) {
-                const isDisabled = await interactBtn.evaluate(el => el.disabled);
-                if (!isDisabled) {
-                    await interactBtn.click();
-                    await page.waitForTimeout(1500);
+            await openAiTools(page);
+            await clickInteract(page);
 
                     // Click on canvas center
                     const canvasWrapper = await page.$('.cvat-canvas-container');
@@ -352,6 +315,7 @@ async function main() {
                         console.log(`  Clicking at: (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
 
                         const lambdaBefore = lambdaResponses.length;
+                        const pointsBefore = await getInteractionPointStats(page);
                         await page.mouse.click(clickX, clickY, { button: 'left' });
 
                         // Wait for response
@@ -362,36 +326,24 @@ async function main() {
                         await page.waitForTimeout(2000);
                         await page.screenshot({ path: path.join(runDir, 'after_click.png'), fullPage: true });
 
+                        const pointStatsAfterClick = await getInteractionPointStats(page);
                         const afterClick = await page.evaluate(() => {
                             const shapes = document.querySelectorAll('.cvat_canvas_shape, .cvat_canvas_shape_mask');
-                            const allCircles = document.querySelectorAll('svg circle');
-                            let maskDetected = false;
-                            const canvases = document.querySelectorAll('.cvat-canvas-container canvas');
-                            for (const c of canvases) {
-                                try {
-                                    const ctx = c.getContext('2d');
-                                    if (ctx) {
-                                        const d = ctx.getImageData(0, 0, Math.min(c.width, 10), Math.min(c.height, 10)).data;
-                                        for (let i = 3; i < d.length; i += 4) { if (d[i] > 0) { maskDetected = true; break; } }
-                                    }
-                                } catch (_) {}
-                                if (maskDetected) break;
-                            }
-                            return { shapeCount: shapes.length, circleCount: allCircles.length, maskDetected };
+                            return { shapeCount: shapes.length };
                         });
-                        console.log(`  After click: shapes=${afterClick.shapeCount}, circles=${afterClick.circleCount}, mask=${afterClick.maskDetected}`);
+                        console.log(`  After click: shapes=${afterClick.shapeCount}, positivePoints=${pointStatsAfterClick.positive}`);
                         results.steps.uiInteraction = {
-                            success: lambdaResponses.length > lambdaBefore || afterClick.maskDetected || afterClick.circleCount > 0,
+                            success: pointStatsAfterClick.positive > pointsBefore.positive,
                             lambdaReceived: lambdaResponses.length > lambdaBefore,
+                            beforePoints: pointsBefore,
+                            afterPoints: pointStatsAfterClick,
                             ...afterClick,
                         };
                         phase2Success = results.steps.uiInteraction.success;
+
+                        const finishResult = await finishAndSave(page, runDir, host, JOB_ID, 'nonsquare');
+                        results.steps.finishAndSave = finishResult;
                     }
-                } else {
-                    console.log('  Interact button is disabled');
-                    results.steps.uiInteraction = { success: false, error: 'Interact button disabled' };
-                }
-            }
         }
     } catch (err) {
         console.error(`  Playwright error: ${err.message}`);
@@ -404,48 +356,44 @@ async function main() {
     fs.writeFileSync(path.join(runDir, 'network_logs.json'), JSON.stringify(networkLogs, null, 2));
     fs.writeFileSync(path.join(runDir, 'lambda_responses.json'), JSON.stringify(lambdaResponses, null, 2));
 
-    await browser.close();
-
     // ========================================
     // Phase 3: Check annotations API for the non-square job
     // ========================================
     console.log('');
     console.log('--- Phase 3: Annotations check ---');
-    const annotResp = await httpRequest(`${host}/api/jobs/${JOB_ID}/annotations`, {
-        method: 'GET',
-        headers: { 'Cookie': cookieStr, 'X-CSRFToken': csrfToken },
-    });
-    fs.writeFileSync(path.join(runDir, 'annotations.json'), annotResp.body);
+    const annotationSummary = await getAnnotationSummary(page, host, JOB_ID);
+    fs.writeFileSync(path.join(runDir, 'annotations.json'), JSON.stringify(annotationSummary, null, 2));
+    console.log(`  Annotations: ${annotationSummary.shapeCount} shapes, ${annotationSummary.maskCount} masks`);
 
-    if (annotResp.status === 200) {
-        try {
-            const annData = JSON.parse(annotResp.body);
-            const shapes = annData.shapes || [];
-            const masks = shapes.filter(s => s.type === 'mask');
-            console.log(`  Annotations: ${shapes.length} shapes, ${masks.length} masks`);
+    const boundsValid = annotationSummary.maskBounds.every(([left, top, right, bottom]) => (
+        left >= 0 && top >= 0 && right <= IMAGE_WIDTH && bottom <= IMAGE_HEIGHT
+    ));
+    results.steps.annotations = annotationSummary;
+    results.steps.maskBounds = {
+        success: annotationSummary.maskBounds.length > 0 && boundsValid,
+        bounds: annotationSummary.maskBounds,
+        boundsValid,
+        imageSize: { width: IMAGE_WIDTH, height: IMAGE_HEIGHT },
+    };
+    results.steps.persistenceCheck = {
+        success: annotationSummary.maskCount > (results.steps.annotationsBefore?.maskCount || 0) &&
+            annotationSummary.semiAutoCount > (results.steps.annotationsBefore?.semiAutoCount || 0),
+        beforeMaskCount: results.steps.annotationsBefore?.maskCount || 0,
+        afterMaskCount: annotationSummary.maskCount,
+        beforeSemiAutoCount: results.steps.annotationsBefore?.semiAutoCount || 0,
+        afterSemiAutoCount: annotationSummary.semiAutoCount,
+    };
 
-            // If there are masks, check their bounding box coordinates
-            for (const mask of masks.slice(0, 5)) {
-                const points = mask.points || [];
-                // RLE format: [rle_data..., left, top, right, bottom]
-                if (points.length >= 4) {
-                    const bounds = points.slice(-4);
-                    console.log(`  Mask bounds (L,T,R,B): [${bounds.join(', ')}]`);
-                    // Check if bounds are within image dimensions
-                    const [left, top, right, bottom] = bounds;
-                    const boundsValid = left >= 0 && top >= 0 && right <= IMAGE_WIDTH && bottom <= IMAGE_HEIGHT;
-                    console.log(`  Bounds within image (${IMAGE_WIDTH}x${IMAGE_HEIGHT}): ${boundsValid}`);
-                    results.steps.maskBounds = { bounds, boundsValid };
-                }
-            }
-            results.steps.annotations = { shapeCount: shapes.length, maskCount: masks.length };
-        } catch (e) {
-            console.error(`  Parse error: ${e.message}`);
-        }
-    }
+    await browser.close();
 
     // Overall determination
-    results.overall = bboxSuccess && pointSuccess ? (phase2Success ? 'PASS' : 'PARTIAL_API_ONLY') : 'FAIL';
+    results.overall = (
+        bboxSuccess &&
+        pointSuccess &&
+        phase2Success &&
+        results.steps.persistenceCheck.success &&
+        results.steps.maskBounds.success
+    ) ? 'PASS' : 'FAIL';
 
     fs.writeFileSync(path.join(runDir, 'non_square_summary.json'), JSON.stringify(results, null, 2));
 

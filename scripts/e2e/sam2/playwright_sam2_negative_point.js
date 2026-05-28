@@ -19,37 +19,27 @@
  */
 const fs = require('fs');
 const path = require('path');
-
-const repoRoot = path.resolve(__dirname, '..', '..', '..');
-
-function loadEnv(envPath) {
-    const env = {};
-    if (!fs.existsSync(envPath)) return env;
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const idx = trimmed.indexOf('=');
-        if (idx > 0) {
-            env[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
-        }
-    }
-    return env;
-}
+const {
+    repoRoot,
+    loadEnv,
+    makeRunDir,
+    requireAuthState,
+    getInteractionPointStats,
+    getAnnotationSummary,
+    clearJobAnnotations,
+    finishAndSave,
+    openAiTools,
+    selectSam2Interactor,
+    setStartWithBBox,
+    clickInteract,
+} = require('./e2e_utils');
 
 async function main() {
     const env = loadEnv(path.join(repoRoot, '.env'));
     const host = env.CVAT_E2E_HOST || 'http://localhost:8080';
 
-    const authStatePath = path.join(repoRoot, 'temp', 'e2e_sam2', 'check', 'auth-state.json');
-    if (!fs.existsSync(authStatePath)) {
-        console.error(`ERROR: Auth state not found at ${authStatePath}. Run 'just e2e-login' first.`);
-        process.exit(1);
-    }
-
-    const ts = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const runDir = path.join(repoRoot, 'temp', 'e2e_sam2', `run_negative_${ts}`);
-    fs.mkdirSync(runDir, { recursive: true });
+    const authStatePath = requireAuthState();
+    const runDir = makeRunDir('run_negative');
 
     const TASK_ID = 181;
     const JOB_ID = 180;
@@ -67,6 +57,7 @@ async function main() {
         viewport: { width: 1920, height: 1080 },
     });
     const page = await context.newPage();
+    const shouldClearAnnotations = env.CVAT_E2E_CLEAR_ANNOTATIONS !== '0';
 
     // Block context menu globally to allow right-click for negative points
     await page.addInitScript(() => {
@@ -107,69 +98,29 @@ async function main() {
     try {
         // Step 1: Navigate to job page
         console.log('Step 1: Navigate to job page...');
+        const clearResult = await clearJobAnnotations(page, host, JOB_ID, shouldClearAnnotations);
+        console.log(`  Clear annotations: ${JSON.stringify(clearResult)}`);
+        results.steps.clearAnnotations = clearResult;
         await page.goto(JOB_URL, { waitUntil: 'networkidle', timeout: 60000 });
         await page.waitForTimeout(3000);
         await page.screenshot({ path: path.join(runDir, '01_job_loaded.png'), fullPage: true });
         results.steps.jobLoad = { success: true };
+        const annotationsBefore = await getAnnotationSummary(page, host, JOB_ID);
+        results.steps.annotationsBefore = annotationsBefore;
 
         // Step 2: Open AI Tools and select SAM2
         console.log('Step 2: Open AI Tools...');
-        const aiToolsBtn = await page.$('.cvat-tools-control');
-        if (!aiToolsBtn) throw new Error('AI Tools button not found');
-        await aiToolsBtn.click();
-        await page.waitForTimeout(1000);
+        await openAiTools(page);
         await page.screenshot({ path: path.join(runDir, '02_ai_tools.png'), fullPage: true });
         results.steps.aiToolsOpen = { success: true };
 
         // Step 3: Select SAM2 and ensure point mode
         console.log('Step 3: Select SAM2 interactor in point mode...');
-        // Check current selection
-        const currentSelection = await page.$eval(
-            '.ant-popover .ant-select-selection-item, .ant-popover-content .ant-select-selection-item',
-            el => el.textContent
-        ).catch(() => 'unknown');
-        console.log(`  Current interactor: "${currentSelection}"`);
-
-        if (!currentSelection.includes('2.1')) {
-            console.log('  Switching to SAM 2.1...');
-            const popoverSelects = await page.$$('.ant-popover .ant-select, .ant-popover-content .ant-select');
-            const interactorSelect = popoverSelects.length >= 2 ? popoverSelects[1] : popoverSelects[0];
-            if (interactorSelect) {
-                await interactorSelect.click();
-                await page.waitForTimeout(500);
-                const sam2Option = await page.$('.ant-select-item-option:has-text("Segment Anything 2.1")');
-                if (sam2Option) {
-                    await sam2Option.click();
-                    await page.waitForTimeout(500);
-                    console.log('  Selected SAM 2.1');
-                } else {
-                    await page.keyboard.press('Escape');
-                }
-                // Re-open popover
-                await page.waitForTimeout(500);
-                const aiToolsBtn2 = await page.$('.cvat-tools-control');
-                if (aiToolsBtn2) {
-                    await aiToolsBtn2.click();
-                    await page.waitForTimeout(1000);
-                }
-            }
-        }
+        const selectionResult = await selectSam2Interactor(page);
+        console.log(`  SAM2 selection result: ${JSON.stringify(selectionResult)}`);
 
         // Toggle "Start with bounding box" OFF via JS
-        const switchToggled = await page.evaluate(() => {
-            const setupDivs = document.querySelectorAll('.cvat-tools-interactor-setups div');
-            for (const div of setupDivs) {
-                if (div.textContent && div.textContent.includes('Start with a bounding box')) {
-                    const sw = div.querySelector('.ant-switch');
-                    if (sw && sw.classList.contains('ant-switch-checked')) {
-                        sw.click();
-                        return { toggled: true };
-                    }
-                    return { toggled: false, wasOff: true };
-                }
-            }
-            return { error: 'Switch not found' };
-        });
+        const switchToggled = await setStartWithBBox(page, false);
         console.log(`  Switch toggle: ${JSON.stringify(switchToggled)}`);
         await page.waitForTimeout(500);
         await page.screenshot({ path: path.join(runDir, '03_point_mode.png'), fullPage: true });
@@ -177,15 +128,8 @@ async function main() {
 
         // Step 4: Click Interact (re-open popover first since switch toggle may have closed it)
         console.log('Step 4: Click Interact...');
-        const aiToolsBtn3 = await page.$('.cvat-tools-control');
-        if (aiToolsBtn3) { await aiToolsBtn3.click(); await page.waitForTimeout(1000); }
-
-        let interactBtn = await page.$('.cvat-tools-interact-button');
-        if (!interactBtn) throw new Error('Interact button not found');
-        const isDisabled = await interactBtn.evaluate(el => el.disabled || el.classList.contains('ant-btn-disabled'));
-        if (isDisabled) throw new Error('Interact button is disabled');
-        await interactBtn.click();
-        await page.waitForTimeout(1500);
+        await openAiTools(page);
+        await clickInteract(page);
         await page.screenshot({ path: path.join(runDir, '04_interact_mode.png'), fullPage: true });
         results.steps.interact = { success: true };
 
@@ -201,6 +145,7 @@ async function main() {
         console.log(`  Positive click at: (${posX.toFixed(0)}, ${posY.toFixed(0)})`);
 
         const lambdaCountBeforePos = lambdaResponses.length;
+        const pointsBefore = await getInteractionPointStats(page);
         await page.mouse.click(posX, posY, { button: 'left' });
 
         // Wait for lambda response
@@ -216,32 +161,20 @@ async function main() {
         await page.screenshot({ path: path.join(runDir, '05_after_positive.png'), fullPage: true });
 
         // Capture canvas state after positive point
+        const pointStatsAfterPositive = await getInteractionPointStats(page);
         const afterPositive = await page.evaluate(() => {
             const shapes = document.querySelectorAll('.cvat_canvas_shape, .cvat_canvas_shape_mask');
-            const allCircles = document.querySelectorAll('svg circle');
-            // Check canvas for mask overlay
-            let maskDetected = false;
-            const canvases = document.querySelectorAll('.cvat-canvas-container canvas');
-            for (const c of canvases) {
-                try {
-                    const ctx = c.getContext('2d');
-                    if (ctx) {
-                        const d = ctx.getImageData(0, 0, Math.min(c.width, 10), Math.min(c.height, 10)).data;
-                        for (let i = 3; i < d.length; i += 4) { if (d[i] > 0) { maskDetected = true; break; } }
-                    }
-                } catch (_) {}
-                if (maskDetected) break;
-            }
-            return {
-                shapeCount: shapes.length,
-                circleCount: allCircles.length,
-                maskDetected,
-            };
+            return { shapeCount: shapes.length };
         });
-        console.log(`  After positive: shapes=${afterPositive.shapeCount}, circles=${afterPositive.circleCount}, mask=${afterPositive.maskDetected}`);
+        Object.assign(afterPositive, {
+            positivePoints: pointStatsAfterPositive.positive,
+            negativePoints: pointStatsAfterPositive.negative,
+            totalPoints: pointStatsAfterPositive.total,
+        });
+        console.log(`  After positive: shapes=${afterPositive.shapeCount}, positivePoints=${afterPositive.positivePoints}, negativePoints=${afterPositive.negativePoints}`);
         console.log(`  Lambda received: ${posLambdaReceived} (count: ${lambdaResponses.length})`);
         results.steps.positiveClick = {
-            success: posLambdaReceived || afterPositive.maskDetected || afterPositive.circleCount > 0,
+            success: pointStatsAfterPositive.positive > pointsBefore.positive,
             lambdaReceived: posLambdaReceived,
             ...afterPositive,
         };
@@ -273,37 +206,20 @@ async function main() {
         await page.screenshot({ path: path.join(runDir, '06_after_negative.png'), fullPage: true });
 
         // Capture canvas state after negative point
+        const pointStatsAfterNegative = await getInteractionPointStats(page);
         const afterNegative = await page.evaluate(() => {
             const shapes = document.querySelectorAll('.cvat_canvas_shape, .cvat_canvas_shape_mask');
-            const allCircles = document.querySelectorAll('svg circle');
-            // Count red circles (negative points are typically red)
-            const redCircles = Array.from(allCircles).filter(c => {
-                const fill = c.getAttribute('fill') || '';
-                return fill.includes('red') || fill.includes('#f00') || fill.includes('#ff0000');
-            });
-            let maskDetected = false;
-            const canvases = document.querySelectorAll('.cvat-canvas-container canvas');
-            for (const c of canvases) {
-                try {
-                    const ctx = c.getContext('2d');
-                    if (ctx) {
-                        const d = ctx.getImageData(0, 0, Math.min(c.width, 10), Math.min(c.height, 10)).data;
-                        for (let i = 3; i < d.length; i += 4) { if (d[i] > 0) { maskDetected = true; break; } }
-                    }
-                } catch (_) {}
-                if (maskDetected) break;
-            }
-            return {
-                shapeCount: shapes.length,
-                circleCount: allCircles.length,
-                redCircles: redCircles.length,
-                maskDetected,
-            };
+            return { shapeCount: shapes.length };
         });
-        console.log(`  After negative: shapes=${afterNegative.shapeCount}, circles=${afterNegative.circleCount}, redCircles=${afterNegative.redCircles}, mask=${afterNegative.maskDetected}`);
+        Object.assign(afterNegative, {
+            positivePoints: pointStatsAfterNegative.positive,
+            negativePoints: pointStatsAfterNegative.negative,
+            totalPoints: pointStatsAfterNegative.total,
+        });
+        console.log(`  After negative: shapes=${afterNegative.shapeCount}, positivePoints=${afterNegative.positivePoints}, negativePoints=${afterNegative.negativePoints}`);
         console.log(`  Lambda received: ${negLambdaReceived} (count: ${lambdaResponses.length})`);
         results.steps.negativeClick = {
-            success: negLambdaReceived || afterNegative.circleCount > afterPositive.circleCount || afterNegative.redCircles > 0,
+            success: pointStatsAfterNegative.negative > pointStatsAfterPositive.negative,
             lambdaReceived: negLambdaReceived,
             ...afterNegative,
         };
@@ -311,24 +227,35 @@ async function main() {
         // Step 7: Compare positive-only vs positive+negative
         console.log('Step 7: Compare states...');
         results.steps.comparison = {
-            positiveCircles: afterPositive.circleCount,
-            afterNegativeCircles: afterNegative.circleCount,
-            negativeRedCircles: afterNegative.redCircles,
-            positiveHadMask: afterPositive.maskDetected,
-            negativeHasMask: afterNegative.maskDetected,
+            beforePoints: pointsBefore,
+            afterPositivePoints: pointStatsAfterPositive,
+            afterNegativePoints: pointStatsAfterNegative,
             contextMenuBlocked: true,
         };
 
-        const circlesIncreased = afterNegative.circleCount > afterPositive.circleCount;
-        const hasNegativePoint = afterNegative.redCircles > 0;
-        console.log(`  Circles increased: ${circlesIncreased} (${afterPositive.circleCount} -> ${afterNegative.circleCount})`);
-        console.log(`  Negative point (red) detected: ${hasNegativePoint}`);
+        const hasPositivePoint = pointStatsAfterPositive.positive > pointsBefore.positive;
+        const hasNegativePoint = pointStatsAfterNegative.negative > pointStatsAfterPositive.negative;
+        console.log(`  Positive point detected: ${hasPositivePoint}`);
+        console.log(`  Negative point detected: ${hasNegativePoint}`);
+
+        // Step 8: Finish the interaction and verify it becomes a persisted semi-auto mask.
+        console.log('Step 8: Finish interaction and check annotations...');
+        const finishResult = await finishAndSave(page, runDir, host, JOB_ID, 'negative');
+        const finalAnnotations = await getAnnotationSummary(page, host, JOB_ID);
+        results.steps.finishAndSave = finishResult;
+        results.steps.finalAnnotations = finalAnnotations;
+        results.steps.persistenceCheck = {
+            success: finalAnnotations.maskCount > annotationsBefore.maskCount &&
+                finalAnnotations.semiAutoCount > annotationsBefore.semiAutoCount,
+            beforeMaskCount: annotationsBefore.maskCount,
+            afterMaskCount: finalAnnotations.maskCount,
+            beforeSemiAutoCount: annotationsBefore.semiAutoCount,
+            afterSemiAutoCount: finalAnnotations.semiAutoCount,
+        };
 
         // Determine overall
-        const hasPositiveResult = posLambdaReceived || afterPositive.maskDetected || afterPositive.circleCount > 0;
-        const hasNegativeResult = negLambdaReceived || circlesIncreased || hasNegativePoint;
-        results.overall = hasPositiveResult && hasNegativeResult ? 'PASS' :
-                          hasPositiveResult ? 'PARTIAL_POSITIVE_ONLY' : 'FAIL';
+        const hasPersistedMask = results.steps.persistenceCheck.success;
+        results.overall = hasPositivePoint && hasNegativePoint && hasPersistedMask ? 'PASS' : 'FAIL';
 
     } catch (err) {
         console.error(`ERROR: ${err.message}`);
