@@ -364,3 +364,96 @@ sam2-api-test username=env_var_or_default("CVAT_USERNAME", "") password=env_var_
     PY
     curl -fsS -c "$cookie" -H "Content-Type: application/json" -d @"$payload" "{{cvat_url}}/api/auth/login" >/dev/null
     curl -fsS -b "$cookie" "{{cvat_url}}/api/lambda/functions?org=" | python3 -m json.tool | grep -E "Segment Anything 2\\.1|pth-facebookresearch-sam2-hiera-large"
+
+# --- E2E harness recipes ---
+
+# E2Eユーザーを作成/更新する。.envからCVAT_E2E_USER/PASSWORDを読む。
+e2e-user:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_DIR="temp/e2e_sam2/run_$(date +%Y%m%d_%H%M%S)"
+    python3 scripts/e2e/sam2/ensure_user.py --run-dir "$RUN_DIR"
+
+# Playwright headlessでCVATにログインし、auth-stateを保存する。
+e2e-login:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NODE_PATH="${HOME}/temp/playwright-cli/node_modules" node scripts/e2e/sam2/playwright_login.js
+
+# E2E task/jobのAPI疎通を確認する。
+e2e-job-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_DIR="temp/e2e_sam2/run_$(date +%Y%m%d_%H%M%S)"
+    python3 scripts/e2e/sam2/api_check.py --run-dir "$RUN_DIR"
+
+# Playwright headlessでjob画面をロードし、screenshot/console/networkを保存する。
+e2e-job-open job_url="http://localhost:8080/tasks/181/jobs/180":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NODE_PATH="${HOME}/temp/playwright-cli/node_modules" node scripts/e2e/sam2/playwright_job_check.js "{{job_url}}"
+
+# SAM2 BBox baseline E2E。API lambda invokeとPlaywright network captureの2段階で検証する。
+e2e-sam2-bbox:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NODE_PATH="${HOME}/temp/playwright-cli/node_modules" node scripts/e2e/sam2/playwright_sam2_bbox.js
+
+# SAM2 Positive Point E2E。AIツール→Interactor→point modeで左クリック→mask生成を検証する。
+e2e-sam2-positive-point:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NODE_PATH="${HOME}/temp/playwright-cli/node_modules" node scripts/e2e/sam2/playwright_sam2_positive_point.js
+
+# SAM2 Negative Point E2E。positive point後にright-clickでnegative pointを追加し、maskの変化を検証する。
+e2e-sam2-negative-point:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NODE_PATH="${HOME}/temp/playwright-cli/node_modules" node scripts/e2e/sam2/playwright_sam2_negative_point.js
+
+# SAM2 Non-Square E2E。640x360画像でbbox/point座標のスケーリングが正しいことを検証する。
+e2e-sam2-non-square:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NODE_PATH="${HOME}/temp/playwright-cli/node_modules" node scripts/e2e/sam2/playwright_sam2_non_square.js
+
+# SAM2 E2E全テストを順に実行する。login→job check→bbox→positive→negative→non-squareを実行し、同一run dirに成果物を集約する。
+e2e-sam2-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_DIR="temp/e2e_sam2/run_all_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$RUN_DIR"
+    echo "=== SAM2 E2E All ===" | tee "$RUN_DIR/summary.txt"
+    echo "Start: $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$RUN_DIR/summary.txt"
+
+    # 各ステップを順に実行。失敗しても全体を止めず記録する。
+    steps=("e2e-login" "e2e-job-check" "e2e-sam2-bbox" "e2e-sam2-positive-point" "e2e-sam2-negative-point" "e2e-sam2-non-square")
+    pass=0; fail=0
+    for step in "${steps[@]}"; do
+        echo "--- $step ---" | tee -a "$RUN_DIR/summary.txt"
+        rc=0
+        just $step > "$RUN_DIR/${step}.log" 2>&1 || rc=$?
+        cat "$RUN_DIR/${step}.log"
+        if [ "$rc" -eq 0 ]; then
+            echo "PASS: $step" | tee -a "$RUN_DIR/summary.txt"
+            pass=$((pass + 1))
+        else
+            echo "FAIL: $step (exit $rc)" | tee -a "$RUN_DIR/summary.txt"
+            fail=$((fail + 1))
+        fi
+    done
+
+    echo "End: $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$RUN_DIR/summary.txt"
+    echo "Pass: $pass / Fail: $fail / Total: $((pass+fail))" | tee -a "$RUN_DIR/summary.txt"
+    echo "Run dir: $RUN_DIR" | tee -a "$RUN_DIR/summary.txt"
+    [ "$fail" -eq 0 ] || exit 1
+
+# CVAT/Nuclio/SAM2の診断ログを一括収集する。500エラー発生時の事後分析用。
+e2e-logs run_dir="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "{{run_dir}}" ]]; then
+        bash scripts/e2e/sam2/collect_logs.sh "{{run_dir}}"
+    else
+        bash scripts/e2e/sam2/collect_logs.sh
+    fi
