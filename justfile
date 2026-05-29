@@ -565,6 +565,12 @@ sam2-ort-up-gpu: aa-up
         echo "SAM2_ORT_MODEL_DIR / SAM2_ORT_MODEL_FILE で配置先を指定してください。" >&2
         exit 2
     fi
+    # Nuclio 1.12.16 の staging copy は .nuclioignore を尊重せず、uv が作る
+    # handler/.venv/lib64 シンボリックリンクで `copy_file_range: is a directory` で失敗する。
+    # 開発成果物 (全て再生成可能) を deploy 前に除去して staging を確実に通す。
+    for junk in .venv .pytest_cache .ruff_cache __pycache__; do
+        rm -rf "{{sam2_ort_dir}}/$junk" "{{sam2_ort_dir}}/sam2_ort_core/__pycache__" "{{sam2_ort_dir}}/tests/__pycache__"
+    done
     echo "Deploying {{sam2_ort_function}} (model mount: $model_path -> /opt/nuclio/models)"
     nuctl create project cvat --platform local 2>/dev/null || true
     nuctl deploy --project-name cvat \
