@@ -575,6 +575,32 @@ sam2-ort-up-gpu: aa-up
         --platform-config '{"attributes": {"network": "cvat_cvat"}}'
     nuctl get function --platform local --namespace nuclio | grep -E 'NAME|{{sam2_ort_function}}' || true
 
+# 【ワンコマンド】serverless基盤を起動→CVAT health待ち→SAM2 ORT GPU関数をdeployまで一括。
+# フル再起動後の migration は時間がかかるため health 待ちは 600s。
+# 例: just sam2-ort-stack            (基盤未起動からの一括起動)
+sam2-ort-stack:
+    just aa-up
+    just wait 600
+    just sam2-ort-up-gpu
+    just sam2-ort-ps
+
+# 【ワンコマンド】基盤を作り直してから一括起動 (aa-down → aa-up → wait → ORT deploy)。
+# Nuclio関数が消えるフル再起動を1コマンドで。状態がおかしい時の最終手段。
+# 例: just sam2-ort-restack
+sam2-ort-restack:
+    just aa-down
+    just aa-up
+    just wait 600
+    just sam2-ort-up-gpu
+    just sam2-ort-ps
+
+# 【ワンコマンド】ORT GPU関数だけ作り直す (基盤は維持・最速)。handler/モデル変更の反映用。
+# 例: just sam2-ort-redeploy
+sam2-ort-redeploy:
+    just sam2-ort-down || true
+    just sam2-ort-up-gpu
+    just sam2-ort-ps
+
 # SAM2 ORT GPU 関数を削除する。serverless基盤やPyTorch版関数は止めない。
 sam2-ort-down:
     nuctl delete function {{sam2_ort_function}} --platform local --namespace nuclio --force
