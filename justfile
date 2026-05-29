@@ -41,11 +41,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 #   ● sam2-up-cpu      : PyTorch CPU 版 (pth-...-large)。GPU不要だが遅い。
 #   ● sam2-up-gpu      : PyTorch GPU 版 (pth-...-large)。GTX1070(sm_61)では
 #                        torch wheel が非対応でクラッシュする既知問題あり (非推奨)。
-#   ● sam2-ort-up-gpu  : ONNX Runtime GPU 版 (ort-...-large)。GTX1070 で
-#                        CUDAExecutionProvider 動作 (本worktreeの主力)。
+#   ● sam2-ort-up-gpu  : ONNX Runtime GPU 版 (ort-...-base-plus)。GTX1070 で
+#                        CUDAExecutionProvider 動作 (本worktreeの主力, default=base_plus)。
 #   ※ pth版とort版は metadata.name が別なので同時deploy可。UI plugin が呼ぶ
 #     関数は cvat-ui/plugins/sam2/src/ts/index.tsx の modelID で決まる
-#     (現状 `ort-facebookresearch-sam2-hiera-large`)。
+#     (現状 `ort-facebookresearch-sam2-hiera-base-plus`)。
 #
 # -----------------------------------------------------------------------------
 # 4. E2E テスト (Playwright CLI, headless)
@@ -79,12 +79,13 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # -----------------------------------------------------------------------------
 # 7. ONNX Runtime GPU 版の重要な前提 (sam2-ort-*)
 # -----------------------------------------------------------------------------
-#   ● モデル配置: encoder ONNX (848MB) は git に入れず host dir を volume mount。
-#     既定 SAM2_ORT_MODEL_DIR=temp/sam2_models_export/models。このファイルを消すと
-#     sam2-ort-up-gpu は exit 2 で停止する (暗黙fallbackなし)。
-#   ● variant 一致必須: CVAT UI の decoder は large 固定 (sam2.1_hiera_large.decoder.onnx)。
-#     encoder も large でないと shape は通っても空マスクになる。
-#     → 採用 encoder は系統A(no_mem_embed加算済) の large (export_onnx.py 由来)。
+#   ● モデル配置: encoder ONNX (base_plus 324MB) は git に入れず host dir を volume mount。
+#     既定 SAM2_ORT_MODEL_DIR=/home/inaho-omen/Project/sam2_onnx_sam_htmx_app_sandbox/models。
+#     このファイルを消すと sam2-ort-up-gpu は exit 2 で停止する (暗黙fallbackなし)。
+#   ● variant 一致必須: CVAT UI の decoder は default=base_plus (sam2.1_hiera_base_plus.decoder.onnx)。
+#     encoder も base_plus でないと shape は通っても空マスクになる。
+#     → 採用 encoder は系統A(no_mem_embed加算済) の base_plus。large に切替は
+#       SAM2_ORT_MODEL_FILE=sam2.1_hiera_large_encoder.onnx 等で override (large 副系統は残存)。
 #   ● GPU 必須: SAM2_ORT_REQUIRE_GPU=true。CUDAExecutionProvider が無ければ
 #     CPU に落とさず明示的に起動失敗する (config/provider/encoder の3層 fail-fast)。
 #
@@ -103,13 +104,16 @@ host := env_var_or_default("CVAT_HOST", "localhost")
 cvat_url := "http://" + host + ":8080"
 
 # SAM2 ONNX Runtime GPU function (sam2-ort-*) settings.
-# モデルONNX(848MB, SAM2.1 hiera large)はimageに焼かず、host dirをvolume mountする。env で上書き可。
-# large encoder を採用する理由: CVAT UI plugin が large decoder asset を使うため、
-# encoder/decoder variant 一致 (large) が必須 (variant 不一致は空マスクになる)。
-sam2_ort_model_dir := env_var_or_default("SAM2_ORT_MODEL_DIR", "/home/inaho-omen/Project/cvat-feature-sam2/temp/sam2_models_export/models")
-sam2_ort_model_file := env_var_or_default("SAM2_ORT_MODEL_FILE", "sam2.1_hiera_large_encoder.onnx")
-sam2_ort_function := "ort-facebookresearch-sam2-hiera-large"
-sam2_ort_container := "nuclio-nuclio-ort-facebookresearch-sam2-hiera-large"
+# default=base_plus (GTX1070 で VRAM 節約: encoder 324MB < large 848MB)。
+# モデルONNX(324MB, SAM2.1 hiera base_plus)はimageに焼かず、host dirをvolume mountする。env で上書き可。
+# encoder/decoder variant 一致必須: CVAT UI plugin が base_plus decoder asset を使うため、
+# encoder も base_plus でないと shape は通っても空マスクになる。
+# large に切替: SAM2_ORT_MODEL_FILE=sam2.1_hiera_large_encoder.onnx 等で override
+# (large decoder asset は副系統として残存)。
+sam2_ort_model_dir := env_var_or_default("SAM2_ORT_MODEL_DIR", "/home/inaho-omen/Project/sam2_onnx_sam_htmx_app_sandbox/models")
+sam2_ort_model_file := env_var_or_default("SAM2_ORT_MODEL_FILE", "sam2.1_hiera_base_plus_encoder.onnx")
+sam2_ort_function := "ort-facebookresearch-sam2-hiera-base-plus"
+sam2_ort_container := "nuclio-nuclio-ort-facebookresearch-sam2-hiera-base-plus"
 sam2_ort_dir := "serverless/onnxruntime/facebookresearch/sam2/nuclio"
 compose := "docker compose -p " + compose_project
 base_files := "-f docker-compose.yml"
@@ -551,9 +555,9 @@ e2e-logs run_dir="":
 # --- SAM2 ONNX Runtime GPU function recipes (sam2-ort-*) ---
 # 注意: これらは PyTorch 版 `sam2-up-cpu`/`sam2-up-gpu`/`sam2-down`/`sam2-logs` とは
 # 別系統。ONNX Runtime GPU (CUDAExecutionProvider 必須・CPU fallback 禁止) の
-# function `ort-facebookresearch-sam2-hiera-large` を扱う。PyTorch 版とは
+# function `ort-facebookresearch-sam2-hiera-base-plus` (default) を扱う。PyTorch 版とは
 # metadata.name が別なので同時 deploy 可能。
-# モデルONNX(848MB, large)は image に焼かず host dir (SAM2_ORT_MODEL_DIR) を volume mount する。
+# モデルONNX(324MB, base_plus)は image に焼かず host dir (SAM2_ORT_MODEL_DIR) を volume mount する。
 
 # SAM2 ORT GPU 関数を deploy する (モデルを /opt/nuclio/models へ volume mount, CUDA必須, aa-up前提)。
 sam2-ort-up-gpu: aa-up

@@ -40,7 +40,7 @@ export interface WorkerInput {
 
 export interface SAM2OutputItem {
     masks: ArrayLike<number>;
-    lowResMasks: Float32Array;
+    lowResMasks: Float32Array | null;
     bounds: [number, number, number, number];
 }
 
@@ -91,25 +91,126 @@ if ((self as any).importScripts) {
                 has_mask_input: new Tensor('float32', new Float32Array([body.maskInput ? 1 : 0]), [1]),
             };
 
-            decoder.run(inputs).then((results) => (
-                Promise.all([
-                    results.xtl.getData(),
-                    results.ytl.getData(),
-                    results.xbr.getData(),
-                    results.ybr.getData(),
-                    results.masks.getData(),
-                    results.low_res_masks.getData(),
-                ])
-            )).then((
-                [xtl, ytl, xbr, ybr, mask, lowResMask]:
-                [any, any, any, any, ArrayLike<number>, Float32Array],
-            ) => {
+            // Decoder-agnostic output handling. The two supported decoders emit `masks` in
+            // different layouts, so we normalise both into the CVAT mask format (a mask cropped
+            // to its bounding box plus inclusive [left, top, right, bottom] bounds):
+            //   - base_plus: `masks` is multimask logits [1, C, H, W] (C=4) over the FULL image.
+            //                We pick the best channel via argmax(iou), binarise (>0), then derive
+            //                the bbox and crop the full-image mask to it.
+            //   - large:     `masks` is a binary mask [1, 1, H, W] ALREADY cropped to its bbox,
+            //                and the absolute bbox is provided via xtl/ytl/xbr/ybr outputs. We use
+            //                those bounds directly (the mask is already crop-sized).
+            // Reading xtl/ytl/xbr/ybr only when present keeps base_plus support (which lacks them)
+            // while preserving large's absolute mask placement.
+            decoder.run(inputs).then((results) => {
+                const masksT = results.masks;
+                const iouT = results.iou_predictions;
+                const lowResT = results.low_res_masks; // may be undefined on some decoders
+                const { xtl, ytl, xbr, ybr } = results; // large-only absolute bbox outputs
+                return Promise.all([
+                    masksT.getData(),
+                    iouT ? iouT.getData() : Promise.resolve(null),
+                    lowResT ? lowResT.getData() : Promise.resolve(null),
+                    xtl ? xtl.getData() : Promise.resolve(null),
+                    ytl ? ytl.getData() : Promise.resolve(null),
+                    xbr ? xbr.getData() : Promise.resolve(null),
+                    ybr ? ybr.getData() : Promise.resolve(null),
+                ]).then(([maskData, iouData, lowResData, xtlData, ytlData, xbrData, ybrData]) => ({
+                    dims: masksT.dims as readonly number[],
+                    maskData: maskData as ArrayLike<number>,
+                    iouData: iouData as ArrayLike<number> | null,
+                    lowResData: lowResData as Float32Array | null,
+                    decoderBounds: (xtlData && ytlData && xbrData && ybrData) ? [
+                        Number((xtlData as ArrayLike<number>)[0]),
+                        Number((ytlData as ArrayLike<number>)[0]),
+                        Number((xbrData as ArrayLike<number>)[0]),
+                        Number((ybrData as ArrayLike<number>)[0]),
+                    ] as [number, number, number, number] : null,
+                }));
+            }).then(({
+                dims, maskData, iouData, lowResData, decoderBounds,
+            }) => {
+                // dims = [1, C, H, W]
+                const channels = dims[1];
+                const height = dims[2];
+                const width = dims[3];
+
+                // Select the best channel via argmax(iou) when multimask; else channel 0.
+                let best = 0;
+                if (iouData && channels > 1) {
+                    let bestValue = -Infinity;
+                    for (let c = 0; c < channels; c++) {
+                        const value = Number(iouData[c]);
+                        if (value > bestValue) {
+                            bestValue = value;
+                            best = c;
+                        }
+                    }
+                }
+
+                const planeSize = height * width;
+                const maskOffset = best * planeSize;
+                const fullMask = new Uint8Array(planeSize);
+                let xtl = width;
+                let ytl = height;
+                let xbr = -1;
+                let ybr = -1;
+                for (let i = 0; i < planeSize; i++) {
+                    if (Number(maskData[maskOffset + i]) > 0) {
+                        fullMask[i] = 1;
+                        const x = i % width;
+                        const y = Math.floor(i / width);
+                        if (x < xtl) xtl = x;
+                        if (x > xbr) xbr = x;
+                        if (y < ytl) ytl = y;
+                        if (y > ybr) ybr = y;
+                    }
+                }
+
+                // CVAT mask RLE encodes the mask cropped to its bounding box; the appended
+                // bounds [left, top, right, bottom] are inclusive and the decoder restores a
+                // (right-left+1) x (bottom-top+1) mask (see cvat-core rle-utils/annotations-objects).
+                let bounds: [number, number, number, number];
+                let binary: Uint8Array;
+                if (decoderBounds) {
+                    // large: `masks` is already cropped to its bbox and the absolute bounds come
+                    // from the decoder. Use the mask plane as-is (its size already equals the crop).
+                    bounds = decoderBounds;
+                    binary = fullMask;
+                } else if (xbr < 0) {
+                    // base_plus: no foreground -> empty mask.
+                    bounds = [0, 0, 0, 0];
+                    binary = new Uint8Array(0);
+                } else {
+                    // base_plus: `masks` covers the full image, so crop it to the derived bbox to
+                    // keep the RLE length consistent with the bounds (else CVAT throws
+                    // "offset is out of bounds").
+                    bounds = [xtl, ytl, xbr, ybr];
+                    const cropWidth = xbr - xtl + 1;
+                    const cropHeight = ybr - ytl + 1;
+                    binary = new Uint8Array(cropWidth * cropHeight);
+                    for (let y = 0; y < cropHeight; y++) {
+                        const srcRow = (ytl + y) * width + xtl;
+                        const dstRow = y * cropWidth;
+                        for (let x = 0; x < cropWidth; x++) {
+                            binary[dstRow + x] = fullMask[srcRow + x];
+                        }
+                    }
+                }
+
+                // Slice the selected channel of low_res_masks for the next refinement step.
+                let lowResMasks: Float32Array | null = null;
+                if (lowResData) {
+                    const lowResPlane = lowResData.length / channels;
+                    lowResMasks = lowResData.slice(best * lowResPlane, (best + 1) * lowResPlane);
+                }
+
                 postMessage({
                     action: WorkerAction.DECODE,
                     payload: {
-                        masks: mask,
-                        lowResMasks: lowResMask,
-                        bounds: [Number(xtl[0]), Number(ytl[0]), Number(xbr[0]), Number(ybr[0])] as const,
+                        masks: binary,
+                        lowResMasks,
+                        bounds,
                     } as SAM2OutputItem,
                 });
             }).catch((error: unknown) => {

@@ -6,19 +6,22 @@
 # Replacement for the PyTorch GPU function on GPUs whose PyTorch wheels lack
 # support (e.g. GTX 1070 / Pascal sm_61). PyTorch is intentionally NOT installed.
 #
-# Model placement: the encoder ONNX (~848MB, SAM2.1 hiera large) is NOT baked into
+# Model placement: the encoder ONNX (~324MB, SAM2.1 hiera base_plus) is NOT baked into
 # the image. It is volume-mounted at /opt/nuclio/models/ at deploy time (see
 # `just sam2-ort-up-gpu` in the repo justfile, which passes
 # --volume <host_model_dir>:/opt/nuclio/models). SAM2_ORT_MODEL_PATH points at the
 # mounted file.
 #
-# Variant note: the CVAT SAM2 UI plugin uses the large decoder
-# (/assets/sam2.1_hiera_large.decoder.onnx). encoder and decoder MUST be the same
-# SAM2.1 variant, so this function serves the large encoder. The function name is
-# the large variant so the plugin (modelID) routes to it.
+# Variant note: base_plus is the CVAT default (smaller VRAM footprint, e.g. GTX 1070).
+# The CVAT SAM2 UI plugin uses the base_plus decoder
+# (/assets/sam2.1_hiera_base_plus.decoder.onnx). encoder and decoder MUST be the same
+# SAM2.1 variant, so this function serves the base_plus encoder. The function name is
+# the base_plus variant so the plugin (modelID) routes to it.
+# To switch to large, deploy with the large encoder/decoder + the large variant name
+# (the large decoder asset is retained as a secondary path).
 
 metadata:
-  name: ort-facebookresearch-sam2-hiera-large
+  name: ort-facebookresearch-sam2-hiera-base-plus
   namespace: cvat
   annotations:
     name: Segment Anything 2.1 (ONNX Runtime GPU)
@@ -31,7 +34,7 @@ metadata:
     help_message: The interactor allows to get a mask of an object using at least one positive, and any negative points inside it
 
 spec:
-  description: Interactive object segmentation with SAM2.1 (hiera large) via ONNX Runtime GPU
+  description: Interactive object segmentation with SAM2.1 (hiera base_plus) via ONNX Runtime GPU
   runtime: 'python:3.10'
   handler: main:handler
   eventTimeout: 120s
@@ -40,7 +43,7 @@ spec:
       value: /opt/nuclio/sam2
     # Encoder ONNX is volume-mounted (not baked into the image).
     - name: SAM2_ORT_MODEL_PATH
-      value: /opt/nuclio/models/sam2.1_hiera_large_encoder.onnx
+      value: /opt/nuclio/models/sam2.1_hiera_base_plus_encoder.onnx
     # Fail-fast GPU policy: CUDAExecutionProvider is required, no CPU fallback.
     - name: SAM2_ORT_PROVIDER
       value: CUDAExecutionProvider
@@ -48,7 +51,7 @@ spec:
       value: 'true'
 
   build:
-    image: cvat.ort.facebookresearch.sam2.hiera_large:latest-gpu
+    image: cvat.ort.facebookresearch.sam2.hiera_base_plus:latest-gpu
     baseImage: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
     directives:

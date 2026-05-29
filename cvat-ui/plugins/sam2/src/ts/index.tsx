@@ -286,7 +286,12 @@ const sam2Plugin: SAM2Plugin = {
 
                                     if (!e.data.error) {
                                         const { masks, lowResMasks, bounds } = e.data.payload as SAM2OutputItem;
-                                        plugin.data.lowResMasks.set(key, lowResMasks);
+                                        if (lowResMasks) {
+                                            plugin.data.lowResMasks.set(key, lowResMasks);
+                                        } else {
+                                            // decoder has no low_res_masks output; disable refinement
+                                            plugin.data.lowResMasks.delete(key);
+                                        }
                                         plugin.data.lastClicks = clicks;
 
                                         let rle = plugin.callbacks.mask2Rle!(masks);
@@ -326,8 +331,8 @@ const sam2Plugin: SAM2Plugin = {
         core: null,
         worker: new Worker(new URL('./inference.worker', import.meta.url)),
         jobs: {},
-        modelID: 'ort-facebookresearch-sam2-hiera-large',
-        modelURL: '/assets/sam2.1_hiera_large.decoder.onnx',
+        modelID: 'ort-facebookresearch-sam2-hiera-base-plus',
+        modelURL: '/assets/sam2.1_hiera_base_plus.decoder.onnx',
         embeddings: new LRUCache({
             // float32 tensor [256, 64, 64] is 4 MB, max 128 MB
             max: 32,
