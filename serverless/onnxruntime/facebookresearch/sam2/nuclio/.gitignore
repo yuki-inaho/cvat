@@ -1,0 +1,8 @@
+# Local Python dev artifacts for the SAM2 ORT core (uv / ruff / pytest).
+# These are recreated on demand and must never be committed or copied into
+# the Nuclio build context (see also .nuclioignore).
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

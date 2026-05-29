@@ -92,7 +92,7 @@ async function main() {
 
     const TASK_ID = 181;
     const JOB_ID = 180;
-    const FUNC_ID = 'pth-facebookresearch-sam2-hiera-large';
+    const FUNC_ID = 'ort-facebookresearch-sam2-hiera-large';
     const JOB_URL = `${host}/tasks/${TASK_ID}/jobs/${JOB_ID}`;
     const LAMBDA_URL = `${host}/api/lambda/functions/${FUNC_ID}`;
 

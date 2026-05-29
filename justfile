@@ -21,6 +21,16 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 compose_project := env_var_or_default("COMPOSE_PROJECT_NAME", "cvat")
 host := env_var_or_default("CVAT_HOST", "localhost")
 cvat_url := "http://" + host + ":8080"
+
+# SAM2 ONNX Runtime GPU function (sam2-ort-*) settings.
+# モデルONNX(848MB, SAM2.1 hiera large)はimageに焼かず、host dirをvolume mountする。env で上書き可。
+# large encoder を採用する理由: CVAT UI plugin が large decoder asset を使うため、
+# encoder/decoder variant 一致 (large) が必須 (variant 不一致は空マスクになる)。
+sam2_ort_model_dir := env_var_or_default("SAM2_ORT_MODEL_DIR", "/home/inaho-omen/Project/cvat-feature-sam2/temp/sam2_models_export/models")
+sam2_ort_model_file := env_var_or_default("SAM2_ORT_MODEL_FILE", "sam2.1_hiera_large_encoder.onnx")
+sam2_ort_function := "ort-facebookresearch-sam2-hiera-large"
+sam2_ort_container := "nuclio-nuclio-ort-facebookresearch-sam2-hiera-large"
+sam2_ort_dir := "serverless/onnxruntime/facebookresearch/sam2/nuclio"
 compose := "docker compose -p " + compose_project
 base_files := "-f docker-compose.yml"
 aa_files := "-f docker-compose.yml -f components/serverless/docker-compose.serverless.yml"
@@ -457,3 +467,91 @@ e2e-logs run_dir="":
     else
         bash scripts/e2e/sam2/collect_logs.sh
     fi
+
+# --- SAM2 ONNX Runtime GPU function recipes (sam2-ort-*) ---
+# 注意: これらは PyTorch 版 `sam2-up-cpu`/`sam2-up-gpu`/`sam2-down`/`sam2-logs` とは
+# 別系統。ONNX Runtime GPU (CUDAExecutionProvider 必須・CPU fallback 禁止) の
+# function `ort-facebookresearch-sam2-hiera-large` を扱う。PyTorch 版とは
+# metadata.name が別なので同時 deploy 可能。
+# モデルONNX(848MB, large)は image に焼かず host dir (SAM2_ORT_MODEL_DIR) を volume mount する。
+
+# SAM2 ORT GPU 関数を deploy する (モデルを /opt/nuclio/models へ volume mount, CUDA必須, aa-up前提)。
+sam2-ort-up-gpu: aa-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    model_path="{{sam2_ort_model_dir}}/{{sam2_ort_model_file}}"
+    if [[ ! -f "$model_path" ]]; then
+        echo "encoder ONNX が見つかりません: $model_path" >&2
+        echo "SAM2_ORT_MODEL_DIR / SAM2_ORT_MODEL_FILE で配置先を指定してください。" >&2
+        exit 2
+    fi
+    echo "Deploying {{sam2_ort_function}} (model mount: $model_path -> /opt/nuclio/models)"
+    nuctl create project cvat --platform local 2>/dev/null || true
+    nuctl deploy --project-name cvat \
+        --path "{{sam2_ort_dir}}" \
+        --file "{{sam2_ort_dir}}/function-ort-gpu.yaml" \
+        --platform local \
+        --volume "{{sam2_ort_model_dir}}:/opt/nuclio/models" \
+        --platform-config '{"attributes": {"network": "cvat_cvat"}}'
+    nuctl get function --platform local --namespace nuclio | grep -E 'NAME|{{sam2_ort_function}}' || true
+
+# SAM2 ORT GPU 関数を削除する。serverless基盤やPyTorch版関数は止めない。
+sam2-ort-down:
+    nuctl delete function {{sam2_ort_function}} --platform local --namespace nuclio --force
+
+# SAM2 ORT 関数の状態と provider を確認する。logsからCUDAExecutionProviderをgrepする。
+sam2-ort-ps:
+    @echo "== nuctl function =="
+    nuctl get function --platform local --namespace nuclio | grep -E 'NAME|{{sam2_ort_function}}' || true
+    @echo
+    @echo "== container =="
+    docker ps --filter name={{sam2_ort_container}} || true
+    @echo
+    @echo "== provider (CUDAExecutionProvider) =="
+    docker logs {{sam2_ort_container}} 2>&1 | grep -E "Provider|CUDAExecutionProvider|SAM2-ORT" | tail -20 || true
+
+# SAM2 ORT 関数コンテナのログを見る。起動時 provider self-test (model IO, provider) を確認できる。
+sam2-ort-logs lines="200":
+    docker logs --tail={{lines}} -f {{sam2_ort_container}}
+
+# SAM2 ORT 関数の最小推論疎通。64x64 PNGを生成しencoder応答3出力のサイズを見る。
+sam2-ort-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 <<'PY'
+    import base64
+    import io
+    import json
+    import subprocess
+    import urllib.request
+    from PIL import Image, ImageDraw
+
+    container = "{{sam2_ort_container}}"
+    port_line = subprocess.check_output(
+        ["docker", "port", container, "8080/tcp"], text=True
+    ).strip().splitlines()[0]
+    port = port_line.rsplit(":", 1)[1]
+
+    image = Image.new("RGB", (64, 64), "white")
+    ImageDraw.Draw(image).rectangle([16, 16, 48, 48], fill="red")
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    body = json.dumps({"image": base64.b64encode(buf.getvalue()).decode()}).encode()
+
+    req = urllib.request.Request(
+        f"http://localhost:{port}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        payload = json.loads(resp.read().decode())
+
+    print("sam2_ort_nuclio_port", port)
+    for key in ("high_res_feats_0", "high_res_feats_1", "image_embed"):
+        print(key, len(base64.b64decode(payload[key])))
+    PY
+
+# SAM2 ORT core の品質ゲート。uv環境で ruff lint/format check と pytest を実行する。
+sam2-ort-lint:
+    cd {{sam2_ort_dir}} && uv run ruff check . && uv run ruff format --check . && uv run pytest

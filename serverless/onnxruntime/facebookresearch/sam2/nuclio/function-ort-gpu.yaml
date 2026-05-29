@@ -1,0 +1,90 @@
+# Copyright (C) 2024-2026 CVAT.ai Corporation
+#
+# SPDX-License-Identifier: MIT
+#
+# SAM2.1 encoder served by ONNX Runtime GPU (CUDAExecutionProvider).
+# Replacement for the PyTorch GPU function on GPUs whose PyTorch wheels lack
+# support (e.g. GTX 1070 / Pascal sm_61). PyTorch is intentionally NOT installed.
+#
+# Model placement: the encoder ONNX (~848MB, SAM2.1 hiera large) is NOT baked into
+# the image. It is volume-mounted at /opt/nuclio/models/ at deploy time (see
+# `just sam2-ort-up-gpu` in the repo justfile, which passes
+# --volume <host_model_dir>:/opt/nuclio/models). SAM2_ORT_MODEL_PATH points at the
+# mounted file.
+#
+# Variant note: the CVAT SAM2 UI plugin uses the large decoder
+# (/assets/sam2.1_hiera_large.decoder.onnx). encoder and decoder MUST be the same
+# SAM2.1 variant, so this function serves the large encoder. The function name is
+# the large variant so the plugin (modelID) routes to it.
+
+metadata:
+  name: ort-facebookresearch-sam2-hiera-large
+  namespace: cvat
+  annotations:
+    name: Segment Anything 2.1 (ONNX Runtime GPU)
+    version: 2
+    type: interactor
+    spec:
+    min_pos_points: 0
+    min_neg_points: 0
+    startswith_box_optional: true
+    help_message: The interactor allows to get a mask of an object using at least one positive, and any negative points inside it
+
+spec:
+  description: Interactive object segmentation with SAM2.1 (hiera large) via ONNX Runtime GPU
+  runtime: 'python:3.10'
+  handler: main:handler
+  eventTimeout: 120s
+  env:
+    - name: PYTHONPATH
+      value: /opt/nuclio/sam2
+    # Encoder ONNX is volume-mounted (not baked into the image).
+    - name: SAM2_ORT_MODEL_PATH
+      value: /opt/nuclio/models/sam2.1_hiera_large_encoder.onnx
+    # Fail-fast GPU policy: CUDAExecutionProvider is required, no CPU fallback.
+    - name: SAM2_ORT_PROVIDER
+      value: CUDAExecutionProvider
+    - name: SAM2_ORT_REQUIRE_GPU
+      value: 'true'
+
+  build:
+    image: cvat.ort.facebookresearch.sam2.hiera_large:latest-gpu
+    baseImage: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+    directives:
+      preCopy:
+      # set NVIDIA container runtime settings
+        - kind: ENV
+          value: NVIDIA_VISIBLE_DEVICES=all
+      # disable interactive frontend
+        - kind: ENV
+          value: DEBIAN_FRONTEND=noninteractive
+      # set workdir (handler code is copied here; PYTHONPATH points here)
+        - kind: WORKDIR
+          value: /opt/nuclio/sam2
+      # install basic deps (python + curl only; no torch, no git build deps)
+        - kind: RUN
+          value: apt-get update && apt-get -y install python3 python3-pip python-is-python3 curl && rm -rf /var/lib/apt/lists/*
+      # install ONNX Runtime GPU + minimal runtime deps (pinned). NO torch/torchvision/sam2.
+        - kind: RUN
+          value: pip3 install --no-cache-dir onnxruntime-gpu==1.19.2 numpy==1.26.4 pillow==10.4.0 jaxtyping==0.2.34 beartype==0.19.0
+      # map pip3 and python3 to pip and python
+        - kind: RUN
+          value: ln -sf /usr/bin/pip3 /usr/local/bin/pip && ln -sf /usr/bin/python3 /usr/bin/python
+  triggers:
+    myHttpTrigger:
+      numWorkers: 1
+      kind: 'http'
+      workerAvailabilityTimeoutMilliseconds: 300000
+      attributes:
+        maxRequestBodySize: 33554432 # 32MB
+  resources:
+    limits:
+      nvidia.com/gpu: 1
+
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
+      mountMode: volume

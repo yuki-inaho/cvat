@@ -326,7 +326,7 @@ const sam2Plugin: SAM2Plugin = {
         core: null,
         worker: new Worker(new URL('./inference.worker', import.meta.url)),
         jobs: {},
-        modelID: 'pth-facebookresearch-sam2-hiera-large',
+        modelID: 'ort-facebookresearch-sam2-hiera-large',
         modelURL: '/assets/sam2.1_hiera_large.decoder.onnx',
         embeddings: new LRUCache({
             // float32 tensor [256, 64, 64] is 4 MB, max 128 MB
