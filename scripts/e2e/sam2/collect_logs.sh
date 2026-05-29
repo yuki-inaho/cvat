@@ -42,7 +42,7 @@ docker logs --tail 300 nuclio > "$RUN_DIR/nuclio.log" 2>&1 || echo "WARN: nuclio
 
 # SAM2 function container logs
 echo "  Collecting SAM2 function logs..."
-docker logs --tail 300 nuclio-nuclio-ort-facebookresearch-sam2-hiera-large > "$RUN_DIR/sam2_function.log" 2>&1 || echo "WARN: SAM2 function logs not available" > "$RUN_DIR/sam2_function.log"
+docker logs --tail 300 nuclio-nuclio-ort-facebookresearch-sam2-hiera-base-plus > "$RUN_DIR/sam2_function.log" 2>&1 || echo "WARN: SAM2 function logs not available" > "$RUN_DIR/sam2_function.log"
 
 # CVAT worker annotation logs (relevant for serverless invoke path)
 echo "  Collecting cvat_worker_annotation logs..."
@@ -62,11 +62,11 @@ just fn-list > "$RUN_DIR/just_fn_list.txt" 2>&1 || echo "WARN: just fn-list fail
 
 # SAM2 port mapping
 echo "  Collecting SAM2 port..."
-docker port nuclio-nuclio-ort-facebookresearch-sam2-hiera-large 8080/tcp > "$RUN_DIR/sam2_port.txt" 2>&1 || echo "WARN: SAM2 port not available" > "$RUN_DIR/sam2_port.txt"
+docker port nuclio-nuclio-ort-facebookresearch-sam2-hiera-base-plus 8080/tcp > "$RUN_DIR/sam2_port.txt" 2>&1 || echo "WARN: SAM2 port not available" > "$RUN_DIR/sam2_port.txt"
 
 # Nuclio function health via nuctl
 echo "  Collecting nuctl function details..."
-nuctl get function ort-facebookresearch-sam2-hiera-large --platform local --namespace nuclio > "$RUN_DIR/nuctl_function.txt" 2>&1 || echo "WARN: nuctl get failed" > "$RUN_DIR/nuctl_function.txt"
+nuctl get function ort-facebookresearch-sam2-hiera-base-plus --platform local --namespace nuclio > "$RUN_DIR/nuctl_function.txt" 2>&1 || echo "WARN: nuctl get failed" > "$RUN_DIR/nuctl_function.txt"
 
 # CVAT health API
 echo "  Collecting CVAT health..."
