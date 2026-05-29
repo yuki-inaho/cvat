@@ -1,22 +1,102 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# 使い方:
-# - 利用可能なコマンド一覧: `just --list`
-# - 通常のCVAT起動/停止: `just up` / `just down`
-# - 半自動アノテーション基盤の起動/停止: `just aa-up` / `just aa-down`
-# - SAM2.1のCPU起動/停止: `just sam2-up-cpu` / `just sam2-down`
-# - SAM2.1のGPU起動: `just sam2-up-gpu`
-# - 状態確認: `just status` / `just ps` / `just aa-ps` / `just sam2-ps`
-# - ログ確認: `just logs cvat_server` / `just sam2-logs`
-# - 管理者作成: `just superuser`
+# =============================================================================
+# CVAT + SAM2 半自動アノテーション 運用 justfile
+# =============================================================================
+# このファイルは CVAT 本体・serverless(Nuclio)基盤・SAM2 アノテーション関数
+# (PyTorch版 / ONNX Runtime GPU版) ・E2E テストを一括操作するための入口。
 #
-# 注意:
+# レシピ一覧は `just --list`。以下は「何をしたいか」別のワークフロー。
+#
+# -----------------------------------------------------------------------------
+# 0. 全体構成 (3 レイヤー)
+# -----------------------------------------------------------------------------
+#   [レイヤー1] CVAT 本体          : up / down / status / logs / superuser
+#   [レイヤー2] serverless基盤(Nuclio): aa-up / aa-down / aa-ps / fn-list
+#   [レイヤー3] モデル関数(Nuclio fn): sam2-up-cpu / sam2-up-gpu / sam2-ort-up-gpu / *-down / *-ps
+#   ※ レイヤーは下に行くほど上位に依存する。aa-down するとレイヤー3の関数は消える。
+#
+# -----------------------------------------------------------------------------
+# 1. はじめての起動 (SAM2 を GPU で動かす - 推奨ルート)
+# -----------------------------------------------------------------------------
+#   just up && just wait           # CVAT 本体を起動し health 200 まで待つ
+#   just aa-up                     # serverless/Nuclio 基盤を起動
+#   just sam2-ort-up-gpu           # SAM2.1 large encoder を ONNX Runtime GPU でdeploy
+#   just status && just sam2-ort-ps  # CVAT と ORT 関数(CUDAExecutionProvider)の確認
+#   → ブラウザ http://localhost:8080 で SAM2 interactor が使える
+#
+# -----------------------------------------------------------------------------
+# 2. 再起動 (restart) — 対象別
+# -----------------------------------------------------------------------------
+#   ● SAM2 ORT 関数だけ作り直す (基盤は維持・最速):
+#       just sam2-ort-down && just sam2-ort-up-gpu && just sam2-ort-ps
+#   ● CVAT 画面がおかしい (本体だけ):
+#       just down && just up && just wait
+#   ● 基盤ごと入れ直す (Nuclio関数は消えるので最後に再deploy):
+#       just aa-down && just aa-up && just wait && just sam2-ort-up-gpu
+#
+# -----------------------------------------------------------------------------
+# 3. SAM2 バックエンドの選択 (3 種類、関数名で排他/共存)
+# -----------------------------------------------------------------------------
+#   ● sam2-up-cpu      : PyTorch CPU 版 (pth-...-large)。GPU不要だが遅い。
+#   ● sam2-up-gpu      : PyTorch GPU 版 (pth-...-large)。GTX1070(sm_61)では
+#                        torch wheel が非対応でクラッシュする既知問題あり (非推奨)。
+#   ● sam2-ort-up-gpu  : ONNX Runtime GPU 版 (ort-...-large)。GTX1070 で
+#                        CUDAExecutionProvider 動作 (本worktreeの主力)。
+#   ※ pth版とort版は metadata.name が別なので同時deploy可。UI plugin が呼ぶ
+#     関数は cvat-ui/plugins/sam2/src/ts/index.tsx の modelID で決まる
+#     (現状 `ort-facebookresearch-sam2-hiera-large`)。
+#
+# -----------------------------------------------------------------------------
+# 4. E2E テスト (Playwright CLI, headless)
+# -----------------------------------------------------------------------------
+#   just e2e-user                  # .env の E2E ユーザーを作成/更新
+#   just e2e-login                 # headless ログインし auth-state 保存
+#   just e2e-sam2-positive-point   # 左クリック positive point
+#   just e2e-sam2-negative-point   # 右クリック negative point
+#   just e2e-sam2-bbox             # BBox プロンプト
+#   just e2e-sam2-non-square       # 640x360 非正方形画像の座標検証
+#   just e2e-sam2-all              # 上記を連続実行 (login→job→bbox→pos→neg→non-square)
+#   → 成果物は temp/e2e_sam2/run_*/ に screenshot/network/console を保存
+#
+# -----------------------------------------------------------------------------
+# 5. 開発ループ (ORT core のコード変更時)
+# -----------------------------------------------------------------------------
+#   just sam2-ort-lint             # cd nuclio && uv run ruff + pytest (型/shape契約検証)
+#   (handler変更を反映) just sam2-ort-down && just sam2-ort-up-gpu
+#   (UI plugin変更を反映) just sam2-ui-up   # cvat_ui を plugin込みで再ビルド
+#
+# -----------------------------------------------------------------------------
+# 6. トラブルシュート
+# -----------------------------------------------------------------------------
+#   ● Bad Gateway / 502        : just status → just logs cvat_server
+#   ● SAM2 が 500 / mask 出ない : just sam2-ort-ps (provider確認) → just sam2-ort-logs
+#                                → just e2e-logs (CVAT/Nuclio/関数ログ一括収集)
+#   ● ORT関数が ready にならない : just sam2-ort-logs で CUDAExecutionProvider と
+#                                model IO を確認。CUDA不在なら fail-fast で起動失敗(設計通り)。
+#   ● mask が空/ずれる          : encoder/decoder の variant 不一致を疑う(7節)。
+#
+# -----------------------------------------------------------------------------
+# 7. ONNX Runtime GPU 版の重要な前提 (sam2-ort-*)
+# -----------------------------------------------------------------------------
+#   ● モデル配置: encoder ONNX (848MB) は git に入れず host dir を volume mount。
+#     既定 SAM2_ORT_MODEL_DIR=temp/sam2_models_export/models。このファイルを消すと
+#     sam2-ort-up-gpu は exit 2 で停止する (暗黙fallbackなし)。
+#   ● variant 一致必須: CVAT UI の decoder は large 固定 (sam2.1_hiera_large.decoder.onnx)。
+#     encoder も large でないと shape は通っても空マスクになる。
+#     → 採用 encoder は系統A(no_mem_embed加算済) の large (export_onnx.py 由来)。
+#   ● GPU 必須: SAM2_ORT_REQUIRE_GPU=true。CUDAExecutionProvider が無ければ
+#     CPU に落とさず明示的に起動失敗する (config/provider/encoder の3層 fail-fast)。
+#
+# -----------------------------------------------------------------------------
+# 8. 補足
+# -----------------------------------------------------------------------------
 # - `COMPOSE_PROJECT_NAME` 未指定時は `cvat` を使う。別worktreeから既存CVATを操作するため。
-# - `aa-*` はCVATのserverless/Nuclio基盤だけを起動・停止する。
-# - `sam*` / `sam2-*` は対象モデルのNuclio関数をdeploy/deleteする。
-# - `sam2-up-cpu` はUI pluginも必要なので、`sam2-ui-up` とSAM2 CPU関数deployをまとめて行う。
-# - GPU版はDocker/NVIDIA runtimeが利用可能な環境でのみ使う。
-# - CVATからNuclio関数を叩く経路はdashboard経由。direct呼び出しはこの環境だとhost.docker.internal:関数portで詰まる。
+# - 管理者作成: `just superuser`。状態確認: `just status`/`just ps`/`just aa-ps`/`just sam2-ps`。
+# - CVATからNuclio関数を叩く経路はdashboard経由。direct呼び出しはこの環境だと
+#   host.docker.internal:関数port で詰まる。
+# - GPU版(pth/ort)はDocker/NVIDIA runtimeが利用可能な環境でのみ使う。
+# =============================================================================
 
 compose_project := env_var_or_default("COMPOSE_PROJECT_NAME", "cvat")
 host := env_var_or_default("CVAT_HOST", "localhost")
