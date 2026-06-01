@@ -1,0 +1,3 @@
+作業メモ:
+ローカルの agent / Claude / Codex 用指示ファイルを誤って commit しないため、リポジトリ直下の CLAUDE.md、CODEX.md、.claude/roles/ を .gitignore に追加した。
+.codex/ と .serena/ は作業端末固有の未追跡ファイルとして残し、commit 対象には含めていない。
