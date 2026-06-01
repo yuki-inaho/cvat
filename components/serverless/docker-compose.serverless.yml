@@ -22,9 +22,15 @@ services:
   cvat_server:
     environment:
       CVAT_SERVERLESS: 1
+      # Local Docker on this machine cannot reach Nuclio function node ports
+      # through host.docker.internal from inside cvat_server. Invoke via the
+      # Nuclio dashboard service on the compose network instead.
+      CVAT_NUCLIO_INVOKE_METHOD: dashboard
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
   cvat_worker_annotation:
+    environment:
+      CVAT_NUCLIO_INVOKE_METHOD: dashboard
     extra_hosts:
       - "host.docker.internal:host-gateway"

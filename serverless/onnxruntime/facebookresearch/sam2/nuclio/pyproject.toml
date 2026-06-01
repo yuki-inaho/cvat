@@ -1,0 +1,34 @@
+[project]
+name = "sam2-ort-core"
+version = "0.1.0"
+description = "ONNX Runtime core for SAM2 encoder Nuclio function (CVAT)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<2",
+    "pillow>=10",
+    "jaxtyping>=0.2.34",
+    "beartype>=0.19",
+    "onnxruntime>=1.16",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sam2_ort_core"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# jaxtyping uses string shape annotations (e.g. Float32[np.ndarray, "1 3 h w"]),
+# which ruff otherwise reports as F722 forward-annotation syntax errors.
+ignore = ["F722"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

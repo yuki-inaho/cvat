@@ -1,0 +1,13 @@
+# Nuclio build context exclusions.
+# 開発専用成果物を function image に含めない（推論には main.py + sam2_ort_core/ のみ必要）。
+# 依存は function-ort-gpu.yaml の pip install で image 内に導入する。
+.venv/
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+pyproject.toml
+uv.lock
+.python-version
