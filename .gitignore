@@ -19,6 +19,11 @@ __pycache__
 /tmp*cvat/
 /temp*/
 
+# Local agent/team instructions copied from personal workspaces
+/CLAUDE.md
+/CODEX.md
+/.claude/roles/
+
 # Ignore generated test files
 docker-compose.tests.yml
 
