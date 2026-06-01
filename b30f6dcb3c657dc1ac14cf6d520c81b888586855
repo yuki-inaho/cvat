@@ -1,0 +1,5 @@
+CI修正メモ:
+GitHub Actions の Trigger dependent repo update workflow が fork 環境で CVAT_BOT_APP_ID / CVAT_BOT_PRIVATE_KEY / CVAT_DEPENDENT_REPO を持たず、actions/create-github-app-token で app-id 不足により失敗していた。
+PR #2 で secrets 不在時は成功扱いで skip し、secrets が揃う本家環境では従来どおり dependent repository dispatch を実行する形に修正した。
+あわせて actions/create-github-app-token を v1 から v3 に更新し、Node.js 20 deprecation warning の解消も狙った。
+修正後の Actions run は success: https://github.com/yuki-inaho/cvat/actions/runs/26731817617
